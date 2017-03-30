@@ -1,0 +1,185 @@
+#!/usr/bin/perl
+
+package MT::Tool::PermissionRebuild;
+use strict;
+use warnings;
+use File::Spec;
+use FindBin;
+use lib map File::Spec->catdir( $FindBin::Bin, File::Spec->updir, $_ ), qw( lib extlib );
+use base qw( MT::Tool );
+
+sub usage { '--debug 1' }
+
+sub help {
+    return q {
+        Member's permission check and repair.
+        --debug 1
+    };
+}
+
+my ( $debug );
+
+sub options {
+    return (
+        'debug=i'  => \$debug,
+    );
+}
+
+sub main {
+    my $class = shift;
+    my ( $verbose ) = $class->SUPER::main( @_ );
+    if ( $debug ) {
+        print "=================================\n";
+        print "PermissionRebuild Start.\n";
+        print "=================================\n";
+    }
+    my $assoc_iter = MT->model( 'association' )->load_iter();
+    my $total_result = 0;
+    while ( my $assoc = $assoc_iter->() ) {
+        my $error;
+        if ( my $role_id = $assoc->role_id ) {
+            my $role = $assoc->role;
+            if (! $role ) {
+                $error = 1;
+                if ( $debug ) {
+                    print "Unknown MT::Association for Role 'ID:${role_id}'\n";
+                }
+            }
+        }
+        if ( my $author_id = $assoc->author_id ) {
+            my $author = MT->model( 'author' )->load( $author_id );
+            if (! $author ) {
+                $error = 1;
+                if ( $debug ) {
+                    print "Unknown MT::Association for Author 'ID:${author_id}'\n";
+                }
+            }
+        }
+        if ( my $group_id = $assoc->group_id ) {
+            my $group = $assoc->group;
+            if (! $group ) {
+                $error = 1;
+                if ( $debug ) {
+                    print "Unknown MT::Association for Group 'ID:${group_id}'\n";
+                }
+            }
+        }
+        if ( my $blog_id = $assoc->blog_id ) {
+            my $blog = $assoc->blog;
+            if (! $blog ) {
+                $error = 1;
+                if ( $debug ) {
+                    print "Unknown MT::Association for Blog 'ID:${blog_id}'\n";
+                }
+                if ( my $author_id = $assoc->author_id ) {
+                    my $permission = MT->model( 'permission' )->load( {
+                        blog_id => $blog_id,
+                        author_id => $author_id } );
+                    if ( $permission ) {
+                        $total_result++;
+                        if ( $debug ) {
+                            print "Member 'ID:${author_id}' has permission for deleted Blog 'ID:${blog_id}'\n";
+                        } else {
+                            $permission->remove or die $permission->errstr;
+                        }
+                    }
+                }
+            }
+        }
+        if ( $error ) {
+            $total_result++;
+            if ( $debug ) {
+                print "=================================\n";
+            } else {
+                $assoc->remove or die $assoc->errstr;
+            }
+        }
+    }
+    my $iter = MT->model( 'author' )->load_iter();
+    while ( my $author = $iter->() ) {
+        my $author_id = $author->id;
+        my $author_name = $author->name;
+        $author_name = MT::I18N::utf8_off( $author_name );
+        require MT::Blog;
+        my $blog_iter = MT::Blog->load_iter( { class => [ 'website', 'blog' ] } );
+        while ( my $blog = $blog_iter->() ) {
+            my $blog_id = $blog->id;
+            my $blog_name = $blog->name;
+            $blog_name = MT::I18N::utf8_off( $blog_name );
+            my $permission = MT->model( 'permission' )->get_by_key( {
+                blog_id => $blog_id,
+                author_id => $author_id } );
+            if (! $permission->id ) {
+                my $permissions = _rebuild_in_mem( $permission );
+                if ( $permissions ) {
+                    $total_result++;
+                    if ( $debug ) {
+                        print "Member '$author_name' has permissions for Blog '$blog_name', but mt_permission was not found.\n";
+                        print "=================================\n";
+                    } else {
+                        $permission->permissions( $permissions );
+                        $permission->save or die $permission->errstr;
+                    }
+                    next;
+                }
+            }
+            my $original = $permission->permissions || '';
+            $original =~ s/\,{2,}/,/;
+            my $permissions = _rebuild_in_mem( $permission ) || '';
+            $permissions =~ s/\,{2,}/,/;
+            if ( $original ne $permissions ) {
+                my @original_perms = split( /,/, $original );
+                my @permissions_perms = split( /,/, $permissions );
+                @original_perms = sort { $a cmp $b } @original_perms;
+                @permissions_perms = sort { $a cmp $b } @permissions_perms;
+                $original = join( ',', @original_perms );
+                $permissions = join( ',', @permissions_perms );
+            }
+            if ( $original ne $permissions ) {
+                $total_result++;
+                if ( $debug ) {
+                    print "Member '$author_name' has permissions for Blog '$blog_name', but mt_permission.permissions are invalid.\n";
+                    print "current : $original\n";
+                    print "rebuild : $permissions \n";
+                    print "=================================\n";
+                } else {
+                    $permission->permissions( _rebuild_in_mem( $permission ) );
+                    if (! $permission->permissions ) {
+                        $permission->remove or die $permission->errstr;
+                    } else {
+                        $permission->save or die $permission->errstr;
+                    }
+                }
+            }
+        }
+    }
+    if ( $debug ) {
+        print "PermissionRebuild End. ${total_result} error(s) found.\n";
+        print "=================================\n";
+    }
+
+}
+
+sub _rebuild_in_mem {
+    my $perm = shift;
+    my $user_id = $perm->author_id;
+    my $blog_id = $perm->blog_id;
+    return unless $user_id && $blog_id;
+    $perm->clear_full_permissions;
+    my $user = MT::Author->load( $user_id ) or return;
+    my $role_iter = $user->role_iter( { blog_id => $blog_id } );
+    if ( $role_iter ) {
+        while ( my $role = $role_iter->() ) {
+            $perm->add_permissions( $role );
+        }
+    }
+    $role_iter = $user->group_role_iter( { blog_id => $blog_id } );
+    if ( $role_iter ) {
+        while ( my $role = $role_iter->() ) {
+            $perm->add_permissions( $role );
+        }
+    }
+    return $perm->permissions;
+}
+
+__PACKAGE__->main() unless caller;
